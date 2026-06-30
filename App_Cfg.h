@@ -31,13 +31,33 @@
  * @details Keep as direct value until added to HardwareConfig.h.
  *          HIGH = power supply error, LOW = normal.
  */
-#define APP_RS485_ISO_POWER_PIN     (3U)
+#define APP_RS485_ISO_POWER_PIN  HW_PIN_ISO_V_STATUS
 
 /*==============================================================================
  *                          TIMING
  *============================================================================*/
 #define APP_ISO_POWER_DEBOUNCE_COUNT    (10U)
 #define APP_DISPLAY_UPDATE_INTERVAL     (10U)
+
+/*==============================================================================
+ *                          MQTT TOPICS
+ *============================================================================*/
+/**
+ * @brief MQTT topic for receiving RTC set commands.
+ *        Payload: {"y":2025,"mo":6,"d":19,"h":14,"mi":30,"s":0}
+ */
+#define MQTT_TOPIC_RTC_SET          "aqi/rtc/set"
+
+/**
+ * @brief MQTT topic for publishing RTC timestamp each sensor cycle.
+ *        Payload: {"ts":"2025-06-19T14:30:00"}
+ */
+#define MQTT_TOPIC_RTC_TIME         "aqi/rtc/time"
+
+/**
+ * @brief MQTT topic for receiving OTA firmware update commands.
+ */
+#define MQTT_TOPIC_OTA_COMMAND      "aqi/ESP32_AQI_001/ota/command"
 
 /*==============================================================================
  *                          FEATURE FLAGS

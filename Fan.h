@@ -88,4 +88,24 @@ bool Fan__IsFailed(void);
  */
 uint16_t Fan__GetRPM(void);
 
+/**
+ * @brief Set PWM frequency at runtime (e.g. from BLE control)
+ * @param hz Desired frequency in Hz, clamped to FAN_FREQ_MIN_HZ..FAN_FREQ_MAX_HZ
+ */
+void Fan__SetFrequency(uint32_t hz);
+
+/**
+ * @brief Get current PWM frequency
+ * @return uint32_t current frequency in Hz
+ */
+uint32_t Fan__GetFrequency(void);
+
+/**
+ * @brief Set fan speed by direct duty percent (0-100%)
+ * @details Bypasses the voltage curve used by Fan__SetVoltage() — use for
+ *          direct BLE/manual control where the app sends an exact percent.
+ * @param percent Desired duty 0-100
+ */
+void Fan__SetDutyPercent(uint8_t percent);
+
 #endif /* FAN_H */

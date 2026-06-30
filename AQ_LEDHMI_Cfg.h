@@ -13,7 +13,12 @@
  *   LED_CPU    -> HW_PIN_LED_CPU    = GPIO39
  *   LED_MODBUS -> HW_PIN_LED_MODBUS = GPIO40
  *
- * @version 1.4.0 -- all pins now reference HW_PIN_* macros
+ * @version 1.5.0
+ *
+ * v1.5.0 changes (review fixes):
+ *   - AQ_LED_*_Config structs removed from header (were static const -- each
+ *     including TU got its own copy, MISRA Rule 2.4 / ODR risk).
+ *     Definitions now live in AQ_LEDHMI.cpp; only extern declarations here.
  */
 
 #ifndef AQ_LEDHMI_CFG_H
@@ -25,12 +30,12 @@
 /*==============================================================================
  *                          PIN DEFINITIONS  (from HardwareConfig.h)
  *============================================================================*/
-#define AQ_LED_BLE_PIN      HW_PIN_LED_BLE      /**< GPIO21  -- Blue LED    */
-#define AQ_LED_ALARM_PIN    HW_PIN_LED_ALARM     /**< GPIO47 -- Red LED     */
-#define AQ_LED_ERROR_PIN    HW_PIN_LED_ERROR     /**< GPIO45 -- Red LED     */
-#define AQ_LED_POWER_PIN    HW_PIN_LED_POWER     /**< GPIO38 -- Green LED   */
-#define AQ_LED_CPU_PIN      HW_PIN_LED_CPU       /**< GPIO39 -- Green LED   */
-#define AQ_LED_MODBUS_PIN   HW_PIN_LED_MODBUS    /**< GPIO40 -- Yellow LED  */
+#define AQ_LED_BLE_PIN      HW_PIN_LED_BLE      /**< GPIO21 -- Blue LED   */
+#define AQ_LED_ALARM_PIN    HW_PIN_LED_ALARM     /**< GPIO47 -- Red LED    */
+#define AQ_LED_ERROR_PIN    HW_PIN_LED_ERROR     /**< GPIO45 -- Red LED    */
+#define AQ_LED_POWER_PIN    HW_PIN_LED_POWER     /**< GPIO38 -- Green LED  */
+#define AQ_LED_CPU_PIN      HW_PIN_LED_CPU       /**< GPIO39 -- Green LED  */
+#define AQ_LED_MODBUS_PIN   HW_PIN_LED_MODBUS    /**< GPIO40 -- Yellow LED */
 
 /*==============================================================================
  *                          ACTIVE LEVEL
@@ -54,59 +59,18 @@
 
 /*==============================================================================
  *                          LED CONFIGURATION STRUCTURES
+ *  Defined in AQ_LEDHMI.cpp -- declared extern here so other TUs do not
+ *  get duplicate copies (was static const in header -- ODR / MISRA Rule 2.4).
  *============================================================================*/
-static const AQ_LED_Config AQ_LED_Power_Config =
-{
-    .pin          = AQ_LED_POWER_PIN,
-    .blink_on_ms  = 0U,
-    .blink_off_ms = 0U,
-    .active_low   = AQ_LED_ACTIVE_LOW
-};
-
-static const AQ_LED_Config AQ_LED_Cpu_Config =
-{
-    .pin          = AQ_LED_CPU_PIN,
-    .blink_on_ms  = AQ_LED_CPU_ON_MS,
-    .blink_off_ms = AQ_LED_CPU_OFF_MS,
-    .active_low   = AQ_LED_ACTIVE_LOW
-};
-
-static const AQ_LED_Config AQ_LED_Error_Config =
-{
-    .pin          = AQ_LED_ERROR_PIN,
-    .blink_on_ms  = AQ_LED_ERROR_BLINK_ON_MS,
-    .blink_off_ms = AQ_LED_ERROR_BLINK_OFF_MS,
-    .active_low   = AQ_LED_ACTIVE_LOW
-};
-
-static const AQ_LED_Config AQ_LED_Alarm_Config =
-{
-    .pin          = AQ_LED_ALARM_PIN,
-    .blink_on_ms  = AQ_LED_ALARM_BLINK_ON_MS,
-    .blink_off_ms = AQ_LED_ALARM_BLINK_OFF_MS,
-    .active_low   = AQ_LED_ACTIVE_LOW
-};
-
-static const AQ_LED_Config AQ_LED_Modbus_Config =
-{
-    .pin          = AQ_LED_MODBUS_PIN,
-    .blink_on_ms  = AQ_LED_MODBUS_BLINK_ON_MS,
-    .blink_off_ms = AQ_LED_MODBUS_BLINK_OFF_MS,
-    .active_low   = AQ_LED_ACTIVE_LOW
-};
-
-static const AQ_LED_Config AQ_LED_Ble_Config =
-{
-    .pin          = AQ_LED_BLE_PIN,
-    .blink_on_ms  = AQ_LED_BLE_BLINK_ON_MS,
-    .blink_off_ms = AQ_LED_BLE_BLINK_OFF_MS,
-    .active_low   = AQ_LED_ACTIVE_LOW
-};
+extern const AQ_LED_Config AQ_LED_Power_Config;
+extern const AQ_LED_Config AQ_LED_Cpu_Config;
+extern const AQ_LED_Config AQ_LED_Error_Config;
+extern const AQ_LED_Config AQ_LED_Alarm_Config;
+extern const AQ_LED_Config AQ_LED_Modbus_Config;
+extern const AQ_LED_Config AQ_LED_Ble_Config;
 
 /*==============================================================================
  *                          VALIDATION
- *  ESP32-S3 GPIO0 is a strapping pin. Ensure no external pull-down on PCB
- *  that could hold it LOW at boot (LED off = safe, NPN driver starts LOW).
  *============================================================================*/
 #if (AQ_LED_CPU_ON_MS < 100U) || (AQ_LED_CPU_OFF_MS < 100U)
 #error "CPU LED timing must be at least 100ms"
