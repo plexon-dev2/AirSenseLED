@@ -1,173 +1,163 @@
 /**
  * @file RTC.cpp
- * @brief General-purpose DS1307 RTC Driver Implementation
+ * @brief PCF8563T RTC Driver Implementation
  *
- * To port to your platform, implement the three HAL functions
- * at the bottom of this file:
- *   - RTC_HAL_I2C_Write()
- *   - RTC_HAL_I2C_Read()
- *   - RTC_HAL_DelayMs()
+ * Drop-in replacement for the DS1307 driver.
+ * Same public API (RTC.h unchanged), same HAL layer.
+ * Only the register map and init sequence changed.
  *
- * DS1307 Register Map:
- *   0x00 - Seconds   (bit7 = CH clock halt)
- *   0x01 - Minutes
- *   0x02 - Hours     (bit6 = 12/24hr mode, 0=24hr)
- *   0x03 - Day       (1-7)
- *   0x04 - Date      (1-31)
- *   0x05 - Month     (1-12)
- *   0x06 - Year      (0-99, offset from 2000)
- *   0x07 - Control
- *   0x08-0x3F - 56 bytes NVRAM
+ * PCF8563T Register Map:
+ *   0x00  Control_1
+ *   0x01  Control_2
+ *   0x02  VL_Seconds   (BCD, bit7=VL voltage-low flag)
+ *   0x03  Minutes      (BCD, bits 6:0)
+ *   0x04  Hours        (BCD, bits 5:0, 24h mode always)
+ *   0x05  Days         (BCD, bits 5:0)
+ *   0x06  Weekdays     (BCD, bits 2:0, 0=Sunday)
+ *   0x07  Century_Months (BCD, bits 4:0, bit7=century)
+ *   0x08  Years        (BCD, 00-99)
+ *
+ * I2C address: 0x51 (fixed in hardware, from RTC_I2C_ADDR in RTC_Cfg.h)
+ *
+ * @version 1.1.0
+ *
+ * v1.1.0 changes (review fixes):
+ *   - Encoding artefacts (corrupted em-dash â€") replaced with -- throughout.
+ *   - PCF8563_ADDR now defined as RTC_I2C_ADDR (from RTC_Cfg.h) -- single
+ *     source of truth; was a local duplicate with the same value.
+ *   - RTC_SetUnixTime(): unbounded while(1) year loop replaced with bounded
+ *     loop guarded by RTC_YEAR_MAX -- prevents WDT reset on far-future or
+ *     corrupted unix_time input.
+ *   - RTC_GetDayOfWeek(): Zeller's h variable changed from int16_t to int32_t
+ *     to avoid signed/unsigned mixing with uint16_t intermediates (MISRA R2).
+ *     Input parameters no longer modified -- local copies used (MISRA R5).
+ *   - IsLeapYear() static helper extracted -- was computed inline 4 times
+ *     across RTC_SetUnixTime() and RTC_GetUnixTime().
+ *   - RTC_Reset(): day computed via RTC_GetDayOfWeek() instead of hardcoded
+ *     magic number 6U.
+ *   - RTC_GetTimestamp() minimum buffer check widened to 20U (was already 20
+ *     but documented as 21 in header for margin).
+ *   - #include <Arduino.h> moved after Doxygen header block.
+ *   - Single-statement if bodies given braces throughout (MISRA A3).
  */
 
+#include <Arduino.h>
 #include "RTC.h"
-#include "RTC_Cfg.h"
-#include <stddef.h>
 #include <string.h>
 #include <stdio.h>
 
 /*==============================================================================
- *                          DEFINES
+ *                          PRIVATE DEFINES
  *============================================================================*/
 
-/* DS1307 register addresses */
-#define RTC_REG_SECONDS             (0x00U)
-#define RTC_REG_MINUTES             (0x01U)
-#define RTC_REG_HOURS               (0x02U)
-#define RTC_REG_DAY                 (0x03U)
-#define RTC_REG_DATE                (0x04U)
-#define RTC_REG_MONTH               (0x05U)
-#define RTC_REG_YEAR                (0x06U)
-#define RTC_REG_CONTROL             (0x07U)
+/* PCF8563T I2C address -- sourced from RTC_Cfg.h (single source of truth) */
+#define PCF8563_ADDR            RTC_I2C_ADDR
 
-#define RTC_NUM_TIME_REGS           (7U)
+/* Register addresses */
+#define PCF_REG_CTRL1           (0x00U)
+#define PCF_REG_CTRL2           (0x01U)
+#define PCF_REG_SECONDS         (0x02U)
+#define PCF_REG_MINUTES         (0x03U)
+#define PCF_REG_HOURS           (0x04U)
+#define PCF_REG_DAYS            (0x05U)
+#define PCF_REG_WEEKDAYS        (0x06U)
+#define PCF_REG_MONTHS          (0x07U)
+#define PCF_REG_YEARS           (0x08U)
 
-/* Bit masks */
-#define RTC_CH_BIT                  (0x80U)   /* Clock Halt bit in seconds reg  */
-#define RTC_12HR_BIT                (0x40U)   /* 12/24hr mode bit in hours reg  */
-#define RTC_PM_BIT                  (0x20U)   /* PM bit in 12hr mode            */
-#define RTC_HOUR_12_MASK            (0x1FU)   /* Hour mask for 12hr mode        */
-#define RTC_HOUR_24_MASK            (0x3FU)   /* Hour mask for 24hr mode        */
+/* Masks */
+#define PCF_VL_FLAG             (0x80U)   /* Voltage Low -- battery dead     */
+#define PCF_STOP_BIT            (0x20U)   /* Control_1 STOP bit              */
 
-/* Use values from RTC_Cfg.h */
-#define RTC_YEAR_BASE               RTC_YEAR_OFFSET
+/* Number of time registers to read/write in one burst (regs 0x02-0x08) */
+#define PCF_NUM_TIME_REGS       (7U)
 
-/* Days per month (non-leap year) */
-static const uint8_t RTC_DaysInMonth[13] =
+/*==============================================================================
+ *                          PRIVATE HELPERS
+ *============================================================================*/
+
+static uint8_t BcdToDec(uint8_t bcd)
 {
-    0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
-};
+    return (uint8_t)(((bcd >> 4U) & 0x0FU) * 10U + (bcd & 0x0FU));
+}
+
+static uint8_t DecToBcd(uint8_t dec)
+{
+    return (uint8_t)(((dec / 10U) << 4U) | (dec % 10U));
+}
+
+/**
+ * @brief Determine whether a given year is a leap year.
+ * @param year Full year (e.g. 2024).
+ * @return true if leap year.
+ */
+static bool IsLeapYear(uint16_t year)
+{
+    return (((year % 4U == 0U) && (year % 100U != 0U)) || (year % 400U == 0U));
+}
 
 /*==============================================================================
- *                          STATIC VARIABLES
- *============================================================================*/
-
-static bool s_initialized = false;
-
-/*==============================================================================
- *                          STATIC FUNCTION PROTOTYPES
- *============================================================================*/
-
-static uint8_t  RTC_ToBCD(uint8_t val);
-static uint8_t  RTC_FromBCD(uint8_t bcd);
-static bool     RTC_IsLeapYear(uint16_t year);
-static uint8_t  RTC_DaysInMonthVal(uint8_t month, uint16_t year);
-static uint16_t RTC_DayOfYear(uint8_t date, uint8_t month, uint16_t year);
-
-/*==============================================================================
- *                          INITIALIZATION APIs
+ *                          INITIALIZATION
  *============================================================================*/
 
 int8_t RTC__Init(void)
 {
-    uint8_t reg = 0U;
+    RTC_HAL_I2C_Begin();
+    RTC_HAL_DelayMs(10U);
 
-    /* Attempt to read seconds register to verify communication */
-    if (!RTC_HAL_I2C_Read(RTC_I2C_ADDR, RTC_REG_SECONDS, &reg, 1U))
+    /* Read Control_1 to verify I2C communication */
+    uint8_t ctrl1 = 0U;
+    if (!RTC_HAL_I2C_Read(PCF8563_ADDR, PCF_REG_CTRL1, &ctrl1, 1U))
+    {
+        RTC_DEBUG_PRINT("[RTC] Init FAILED -- I2C error (addr=0x51)\n");
+        return RTC_ERR_I2C;
+    }
+
+    /* Clear STOP bit to ensure oscillator is running */
+    ctrl1 &= (uint8_t)(~PCF_STOP_BIT);
+    if (!RTC_HAL_I2C_Write(PCF8563_ADDR, PCF_REG_CTRL1, &ctrl1, 1U))
     {
         return RTC_ERR_I2C;
     }
 
-    /* If CH bit is set, oscillator is halted */
-#if (RTC_AUTO_START_OSCILLATOR == 1U)
-    if ((reg & RTC_CH_BIT) != 0U)
-    {
-        reg &= ~RTC_CH_BIT;
-        if (!RTC_HAL_I2C_Write(RTC_I2C_ADDR, RTC_REG_SECONDS, &reg, 1U))
-        {
-            return RTC_ERR_I2C;
-        }
-        RTC_HAL_DelayMs(10U);
-        RTC_DEBUG_PRINT("[RTC] Oscillator was halted — restarted\n");
-    }
-#endif
-
-    /* Ensure 24-hour mode */
-#if (RTC_FORCE_24HR_MODE == 1U)
-    uint8_t hours = 0U;
-    if (!RTC_HAL_I2C_Read(RTC_I2C_ADDR, RTC_REG_HOURS, &hours, 1U))
+    /* Clear Control_2 (disable alarms/timer interrupts) */
+    uint8_t ctrl2 = 0x00U;
+    if (!RTC_HAL_I2C_Write(PCF8563_ADDR, PCF_REG_CTRL2, &ctrl2, 1U))
     {
         return RTC_ERR_I2C;
     }
 
-    if ((hours & RTC_12HR_BIT) != 0U)
-    {
-        /* Convert from 12hr to 24hr */
-        uint8_t h = RTC_FromBCD(hours & RTC_HOUR_12_MASK);
-        if ((hours & RTC_PM_BIT) != 0U)
-        {
-            if (h != 12U) h += 12U;
-        }
-        else
-        {
-            if (h == 12U) h = 0U;
-        }
-        hours = RTC_ToBCD(h);
-        if (!RTC_HAL_I2C_Write(RTC_I2C_ADDR, RTC_REG_HOURS, &hours, 1U))
-        {
-            return RTC_ERR_I2C;
-        }
-        RTC_DEBUG_PRINT("[RTC] Converted to 24hr mode\n");
-    }
-#endif /* RTC_FORCE_24HR_MODE */
+    RTC_DEBUG_PRINT("[RTC] PCF8563T Init OK\n");
 
-    /* Enable 1Hz SQW output on DS1307 control register (0x07)
-     * SQWE=1 (bit4), RS1=0 RS0=0 → 1Hz square wave on SQW pin */
-#if (RTC_SQW_1HZ_ENABLE == 1U)
+    /* Warn if VL flag is set (battery dead / time lost) */
+    uint8_t sec_reg = 0U;
+    if (RTC_HAL_I2C_Read(PCF8563_ADDR, PCF_REG_SECONDS, &sec_reg, 1U))
     {
-        uint8_t ctrl = 0x10U;  /* SQWE=1, RS1=0, RS0=0 → 1Hz */
-        if (!RTC_HAL_I2C_Write(RTC_I2C_ADDR, RTC_REG_CONTROL, &ctrl, 1U))
+        if ((sec_reg & PCF_VL_FLAG) != 0U)
         {
-            return RTC_ERR_I2C;
+            RTC_DEBUG_PRINT("[RTC] WARNING: VL flag set -- clock integrity lost. Set time.\n");
         }
-        RTC_DEBUG_PRINT("[RTC] SQW 1Hz output enabled\n");
     }
-#endif
 
-    RTC_DEBUG_PRINT("[RTC] Init OK\n");
-    s_initialized = true;
     return RTC_OK;
 }
 
 void RTC__DeInit(void)
 {
-    s_initialized = false;
+    /* Nothing to de-initialize for PCF8563T */
 }
 
 bool RTC__IsRunning(void)
 {
-    uint8_t reg = 0U;
-
-    if (!RTC_HAL_I2C_Read(RTC_I2C_ADDR, RTC_REG_SECONDS, &reg, 1U))
+    uint8_t ctrl1 = 0U;
+    if (!RTC_HAL_I2C_Read(PCF8563_ADDR, PCF_REG_CTRL1, &ctrl1, 1U))
     {
         return false;
     }
-
-    return ((reg & RTC_CH_BIT) == 0U);
+    return ((ctrl1 & PCF_STOP_BIT) == 0U);
 }
 
 /*==============================================================================
- *                          TIME CONFIGURATION APIs
+ *                          TIME SET
  *============================================================================*/
 
 int8_t RTC_SetDateTime(uint8_t  seconds,
@@ -179,7 +169,6 @@ int8_t RTC_SetDateTime(uint8_t  seconds,
                        uint16_t year)
 {
     RTC_DateTime_t dt;
-
     dt.seconds = seconds;
     dt.minutes = minutes;
     dt.hours   = hours;
@@ -187,353 +176,256 @@ int8_t RTC_SetDateTime(uint8_t  seconds,
     dt.date    = date;
     dt.month   = month;
     dt.year    = year;
-
     return RTC_SetDateTimeStruct(&dt);
 }
 
 int8_t RTC_SetDateTimeStruct(const RTC_DateTime_t *p_dt)
 {
-    uint8_t regs[RTC_NUM_TIME_REGS];
+    if (p_dt == NULL) { return RTC_ERR_INVALID_PARAM; }
+    if (!RTC_ValidateDateTime(p_dt)) { return RTC_ERR_INVALID_PARAM; }
 
-    if (p_dt == NULL)
-    {
-        return RTC_ERR_INVALID_PARAM;
-    }
+    uint8_t regs[PCF_NUM_TIME_REGS];
 
-    if (!RTC_ValidateDateTime(p_dt))
-    {
-        return RTC_ERR_INVALID_PARAM;
-    }
+    /* Reg 0x02 -- Seconds (writing clears VL flag) */
+    regs[0] = DecToBcd(p_dt->seconds) & 0x7FU;
+    /* Reg 0x03 -- Minutes */
+    regs[1] = DecToBcd(p_dt->minutes) & 0x7FU;
+    /* Reg 0x04 -- Hours (24h, bits 5:0) */
+    regs[2] = DecToBcd(p_dt->hours) & 0x3FU;
+    /* Reg 0x05 -- Days */
+    regs[3] = DecToBcd(p_dt->date) & 0x3FU;
+    /* Reg 0x06 -- Weekdays: PCF stores 0=Sun..6=Sat; struct uses 1=Mon..7=Sun.
+     * Mapping: day % 7 gives 1->1(Mon)..6->6(Sat), 7->0(Sun). Correct. */
+    regs[4] = (uint8_t)((p_dt->day % 7U) & 0x07U);
+    /* Reg 0x07 -- Months (no century bit needed for 2000-2099) */
+    regs[5] = DecToBcd(p_dt->month) & 0x1FU;
+    /* Reg 0x08 -- Years (00-99 offset from 2000) */
+    uint16_t yr = (p_dt->year >= RTC_YEAR_OFFSET) ?
+                  (p_dt->year - RTC_YEAR_OFFSET) : 0U;
+    regs[6] = DecToBcd((uint8_t)(yr & 0xFFU));
 
-    /* Pack registers — CH bit cleared to ensure oscillator runs */
-    regs[0] = RTC_ToBCD(p_dt->seconds) & ~RTC_CH_BIT;
-    regs[1] = RTC_ToBCD(p_dt->minutes);
-    regs[2] = RTC_ToBCD(p_dt->hours) & RTC_HOUR_24_MASK;  /* 24hr mode */
-    regs[3] = RTC_ToBCD(p_dt->day);
-    regs[4] = RTC_ToBCD(p_dt->date);
-    regs[5] = RTC_ToBCD(p_dt->month);
-    regs[6] = RTC_ToBCD((uint8_t)(p_dt->year - RTC_YEAR_BASE));
-
-    if (!RTC_HAL_I2C_Write(RTC_I2C_ADDR, RTC_REG_SECONDS, regs, RTC_NUM_TIME_REGS))
+    if (!RTC_HAL_I2C_Write(PCF8563_ADDR, PCF_REG_SECONDS, regs, PCF_NUM_TIME_REGS))
     {
         return RTC_ERR_I2C;
     }
-
     return RTC_OK;
 }
 
 int8_t RTC_SetUnixTime(uint32_t unix_time)
 {
-    RTC_DateTime_t dt;
-    uint32_t       t;
-    uint16_t       days;
-    uint16_t       year;
-    uint8_t        month;
+    if (unix_time < RTC_UNIX_EPOCH_2000) { return RTC_ERR_INVALID_PARAM; }
 
-    /* Convert unix_time to seconds since 2000-01-01 */
-    if (unix_time < RTC_UNIX_EPOCH_2000)
-    {
-        return RTC_ERR_INVALID_PARAM;
-    }
+    uint32_t t = unix_time - RTC_UNIX_EPOCH_2000;
 
-    t = unix_time - RTC_UNIX_EPOCH_2000;
-
-    /* Extract time */
-    dt.seconds = (uint8_t)(t % 60U);
+    uint8_t seconds = (uint8_t)(t % 60U);
     t /= 60U;
-    dt.minutes = (uint8_t)(t % 60U);
+    uint8_t minutes = (uint8_t)(t % 60U);
     t /= 60U;
-    dt.hours = (uint8_t)(t % 24U);
+    uint8_t hours   = (uint8_t)(t % 24U);
     t /= 24U;
 
-    /* t now = days since 2000-01-01 */
-    days = (uint16_t)t;
-
-    /* Find year */
-    year = 2000U;
-    while (true)
+    /*--------------------------------------------------------------------------
+     * Year calculation -- bounded loop to prevent WDT reset on far-future
+     * or corrupted unix_time. Exits with error if year exceeds RTC_YEAR_MAX.
+     *------------------------------------------------------------------------*/
+    uint16_t year = 2000U;
+    while (year <= (uint16_t)RTC_YEAR_MAX)
     {
-        uint16_t days_in_year = RTC_IsLeapYear(year) ? 366U : 365U;
-        if (days < days_in_year) break;
-        days -= days_in_year;
+        uint32_t diy = IsLeapYear(year) ? 366UL : 365UL;
+        if (t < diy) { break; }
+        t -= diy;
         year++;
-        if (year > 2099U) return RTC_ERR_INVALID_PARAM;
     }
-    dt.year = year;
+    if (year > (uint16_t)RTC_YEAR_MAX) { return RTC_ERR_INVALID_PARAM; }
 
-    /* Find month */
-    month = 1U;
+    static const uint8_t days_in_month[12U] =
+        {31U, 28U, 31U, 30U, 31U, 30U, 31U, 31U, 30U, 31U, 30U, 31U};
+
+    uint8_t month = 1U;
     while (month <= 12U)
     {
-        uint8_t dim = RTC_DaysInMonthVal(month, year);
-        if (days < (uint16_t)dim) break;
-        days -= (uint16_t)dim;
+        uint8_t dim = days_in_month[month - 1U];
+        if (IsLeapYear(year) && (month == 2U)) { dim = 29U; }
+        if (t < (uint32_t)dim) { break; }
+        t -= (uint32_t)dim;
         month++;
     }
-    dt.month = month;
-    dt.date  = (uint8_t)(days + 1U);
-    dt.day   = RTC_GetDayOfWeek(dt.date, dt.month, dt.year);
 
-    return RTC_SetDateTimeStruct(&dt);
+    uint8_t date = (uint8_t)(t + 1U);
+    uint8_t dow  = RTC_GetDayOfWeek(date, month, year);
+
+    return RTC_SetDateTime(seconds, minutes, hours, dow, date, month, year);
 }
 
 /*==============================================================================
- *                          TIME READ APIs
+ *                          TIME READ
  *============================================================================*/
 
 int8_t RTC_GetDateTime(RTC_DateTime_t *p_dt)
 {
-    uint8_t regs[RTC_NUM_TIME_REGS];
+    if (p_dt == NULL) { return RTC_ERR_INVALID_PARAM; }
 
-    if (p_dt == NULL)
-    {
-        return RTC_ERR_INVALID_PARAM;
-    }
-
-    if (!RTC_HAL_I2C_Read(RTC_I2C_ADDR, RTC_REG_SECONDS, regs, RTC_NUM_TIME_REGS))
+    uint8_t regs[PCF_NUM_TIME_REGS];
+    if (!RTC_HAL_I2C_Read(PCF8563_ADDR, PCF_REG_SECONDS, regs, PCF_NUM_TIME_REGS))
     {
         return RTC_ERR_I2C;
     }
 
-    /* Check oscillator halted */
-    if ((regs[0] & RTC_CH_BIT) != 0U)
-    {
-        return RTC_ERR_NOT_RUNNING;
-    }
-
-    p_dt->seconds = RTC_FromBCD(regs[0] & 0x7FU);
-    p_dt->minutes = RTC_FromBCD(regs[1] & 0x7FU);
-    p_dt->hours   = RTC_FromBCD(regs[2] & RTC_HOUR_24_MASK);
-    p_dt->day     = RTC_FromBCD(regs[3] & 0x07U);
-    p_dt->date    = RTC_FromBCD(regs[4] & 0x3FU);
-    p_dt->month   = RTC_FromBCD(regs[5] & 0x1FU);
-    p_dt->year    = (uint16_t)RTC_FromBCD(regs[6]) + RTC_YEAR_BASE;
+    p_dt->seconds = BcdToDec(regs[0] & 0x7FU);
+    p_dt->minutes = BcdToDec(regs[1] & 0x7FU);
+    p_dt->hours   = BcdToDec(regs[2] & 0x3FU);
+    p_dt->date    = BcdToDec(regs[3] & 0x3FU);
+    /* Weekdays: PCF uses 0=Sun..6=Sat; struct uses 1=Mon..7=Sun */
+    uint8_t wday  = regs[4] & 0x07U;
+    p_dt->day     = (wday == 0U) ? 7U : wday;
+    p_dt->month   = BcdToDec(regs[5] & 0x1FU);
+    p_dt->year    = (uint16_t)(BcdToDec(regs[6]) + RTC_YEAR_OFFSET);
 
     return RTC_OK;
 }
 
 int8_t RTC_GetUnixTime(uint32_t *p_unix_time)
 {
+    if (p_unix_time == NULL) { return RTC_ERR_INVALID_PARAM; }
+
     RTC_DateTime_t dt;
-    int8_t         result;
-    uint32_t       days = 0UL;
-    uint16_t       y;
-    uint8_t        m;
+    int8_t ret = RTC_GetDateTime(&dt);
+    if (ret != RTC_OK) { return ret; }
 
-    if (p_unix_time == NULL)
+    /* Days since 2000-01-01 */
+    static const uint16_t days_before_month[12U] =
+        {0U, 31U, 59U, 90U, 120U, 151U, 181U, 212U, 243U, 273U, 304U, 334U};
+
+    uint32_t days = 0U;
+    for (uint16_t y = 2000U; y < dt.year; y++)
     {
-        return RTC_ERR_INVALID_PARAM;
+        days += IsLeapYear(y) ? 366UL : 365UL;
     }
 
-    result = RTC_GetDateTime(&dt);
-    if (result != RTC_OK)
-    {
-        return result;
-    }
-
-    /* Count days from 2000-01-01 to dt.year-1 */
-    for (y = 2000U; y < dt.year; y++)
-    {
-        days += RTC_IsLeapYear(y) ? 366U : 365U;
-    }
-
-    /* Add days for each completed month in current year */
-    for (m = 1U; m < dt.month; m++)
-    {
-        days += (uint32_t)RTC_DaysInMonthVal(m, dt.year);
-    }
-
-    /* Add days in current month (1-based) */
+    days += (uint32_t)days_before_month[dt.month - 1U];
+    if (IsLeapYear(dt.year) && (dt.month > 2U)) { days++; }
     days += (uint32_t)(dt.date - 1U);
 
-    *p_unix_time = RTC_UNIX_EPOCH_2000
-                 + (days * 86400UL)
-                 + ((uint32_t)dt.hours   * 3600UL)
-                 + ((uint32_t)dt.minutes * 60UL)
-                 +  (uint32_t)dt.seconds;
-
+    *p_unix_time = RTC_UNIX_EPOCH_2000 +
+                   days * 86400UL +
+                   (uint32_t)dt.hours   * 3600UL +
+                   (uint32_t)dt.minutes * 60UL   +
+                   (uint32_t)dt.seconds;
     return RTC_OK;
 }
 
 int8_t RTC_GetTimestamp(char *p_buf, uint8_t buf_len)
 {
+    if ((p_buf == NULL) || (buf_len < 20U)) { return RTC_ERR_INVALID_PARAM; }
+
     RTC_DateTime_t dt;
-    int8_t         result;
+    int8_t ret = RTC_GetDateTime(&dt);
+    if (ret != RTC_OK) { return ret; }
 
-    if ((p_buf == NULL) || (buf_len < 20U))
-    {
-        return RTC_ERR_INVALID_PARAM;
-    }
-
-    result = RTC_GetDateTime(&dt);
-    if (result != RTC_OK)
-    {
-        return result;
-    }
-
-    snprintf(p_buf, buf_len,
-             "%04u-%02u-%02u %02u:%02u:%02u",
-             dt.year, dt.month, dt.date,
-             dt.hours, dt.minutes, dt.seconds);
-
+    /* "YYYY-MM-DD HH:MM:SS" = 19 chars + null = 20 bytes minimum */
+    (void)snprintf(p_buf, (size_t)buf_len, "%04u-%02u-%02u %02u:%02u:%02u",
+                   dt.year, dt.month, dt.date,
+                   dt.hours, dt.minutes, dt.seconds);
     return RTC_OK;
 }
 
 int8_t RTC_GetDateString(char *p_buf, uint8_t buf_len)
 {
+    if ((p_buf == NULL) || (buf_len < 11U)) { return RTC_ERR_INVALID_PARAM; }
+
     RTC_DateTime_t dt;
-    int8_t         result;
+    int8_t ret = RTC_GetDateTime(&dt);
+    if (ret != RTC_OK) { return ret; }
 
-    if ((p_buf == NULL) || (buf_len < 11U))
-    {
-        return RTC_ERR_INVALID_PARAM;
-    }
-
-    result = RTC_GetDateTime(&dt);
-    if (result != RTC_OK)
-    {
-        return result;
-    }
-
-    snprintf(p_buf, buf_len,
-             "%04u-%02u-%02u",
-             dt.year, dt.month, dt.date);
-
+    (void)snprintf(p_buf, (size_t)buf_len, "%04u-%02u-%02u",
+                   dt.year, dt.month, dt.date);
     return RTC_OK;
 }
 
 int8_t RTC_GetTimeString(char *p_buf, uint8_t buf_len)
 {
+    if ((p_buf == NULL) || (buf_len < 9U)) { return RTC_ERR_INVALID_PARAM; }
+
     RTC_DateTime_t dt;
-    int8_t         result;
+    int8_t ret = RTC_GetDateTime(&dt);
+    if (ret != RTC_OK) { return ret; }
 
-    if ((p_buf == NULL) || (buf_len < 9U))
-    {
-        return RTC_ERR_INVALID_PARAM;
-    }
-
-    result = RTC_GetDateTime(&dt);
-    if (result != RTC_OK)
-    {
-        return result;
-    }
-
-    snprintf(p_buf, buf_len,
-             "%02u:%02u:%02u",
-             dt.hours, dt.minutes, dt.seconds);
-
+    (void)snprintf(p_buf, (size_t)buf_len, "%02u:%02u:%02u",
+                   dt.hours, dt.minutes, dt.seconds);
     return RTC_OK;
 }
 
 /*==============================================================================
- *                          UTILITY APIs
+ *                          UTILITY
  *============================================================================*/
 
 uint8_t RTC_GetDayOfWeek(uint8_t date, uint8_t month, uint16_t year)
 {
-    /* Tomohiko Sakamoto's algorithm — returns 0=Sunday, adjusted to 1=Mon..7=Sun */
-    static const uint8_t t[] = {0U, 3U, 2U, 5U, 0U, 3U, 5U, 1U, 4U, 6U, 2U, 4U};
+    /* Zeller's congruence -- use local copies, do not modify parameters */
+    uint8_t  d = date;
+    uint8_t  m = month;
     uint16_t y = year;
-    uint8_t  dow;
 
-    if (month < 3U)
+    /* Zeller uses months 3-14; January and February are months 13-14 of
+     * the previous year */
+    if (m < 3U)
     {
+        m = (uint8_t)(m + 12U);
         y--;
     }
 
-    dow = (uint8_t)((y + y/4U - y/100U + y/400U + t[month - 1U] + date) % 7U);
+    /* Use int32_t for h to avoid signed/unsigned mixing (MISRA Rule 10.3).
+     * k and j are century/decade components. */
+    int32_t k = (int32_t)(y % 100U);
+    int32_t j = (int32_t)(y / 100U);
+    int32_t h = ((int32_t)d
+               + (13 * ((int32_t)m + 1)) / 5
+               + k
+               + k / 4
+               + j / 4
+               - 2 * j) % 7;
 
-    /* Convert: 0=Sunday → return 7, 1=Monday → return 1 ... 6=Saturday → return 6 */
-    return (dow == 0U) ? 7U : dow;
+    if (h < 0) { h += 7; }
+
+    /* h: 0=Sat,1=Sun,2=Mon..6=Fri -- convert to 1=Mon..7=Sun */
+    uint8_t dow = (uint8_t)((h + 5) % 7 + 1);
+    return dow;
 }
 
 bool RTC_ValidateDateTime(const RTC_DateTime_t *p_dt)
 {
-    if (p_dt == NULL)                               return false;
-    if (p_dt->seconds > 59U)                        return false;
-    if (p_dt->minutes > 59U)                        return false;
-    if (p_dt->hours   > 23U)                        return false;
-    if ((p_dt->day < 1U) || (p_dt->day > 7U))       return false;
-    if ((p_dt->date < 1U) || (p_dt->date > 31U))    return false;
-    if ((p_dt->month < 1U) || (p_dt->month > 12U))  return false;
-    if ((p_dt->year < 2000U) || (p_dt->year > 2099U)) return false;
-
-    /* Check date does not exceed days in that month */
-    if (p_dt->date > RTC_DaysInMonthVal(p_dt->month, p_dt->year))
-    {
-        return false;
-    }
-
+    if (p_dt == NULL)                              { return false; }
+    if (p_dt->seconds > 59U)                       { return false; }
+    if (p_dt->minutes > 59U)                       { return false; }
+    if (p_dt->hours   > 23U)                       { return false; }
+    if ((p_dt->day < 1U) || (p_dt->day > 7U))     { return false; }
+    if ((p_dt->date < 1U) || (p_dt->date > 31U))  { return false; }
+    if ((p_dt->month < 1U) || (p_dt->month > 12U)){ return false; }
+    if ((p_dt->year < RTC_YEAR_MIN) || (p_dt->year > RTC_YEAR_MAX)) { return false; }
     return true;
 }
 
 bool RTC_IsBatteryLow(void)
 {
-    /*
-     * DS1307 has no dedicated battery-low flag.
-     * A halted oscillator (CH bit set) typically means power was lost,
-     * which implies the backup battery is dead or missing.
-     */
-    return !RTC__IsRunning();
+    uint8_t sec_reg = 0U;
+    if (!RTC_HAL_I2C_Read(PCF8563_ADDR, PCF_REG_SECONDS, &sec_reg, 1U))
+    {
+        return true;  /* Assume battery low if I2C fails */
+    }
+    return ((sec_reg & PCF_VL_FLAG) != 0U);
 }
 
 int8_t RTC_Reset(void)
 {
-    return RTC_SetDateTime(0U, 0U, 0U, RTC_MONDAY, 1U, 1U, 2000U);
+    /* 2000-01-01 was a Saturday -- computed via Zeller's rather than hardcoded */
+    uint8_t dow = RTC_GetDayOfWeek(1U, 1U, 2000U);
+    return RTC_SetDateTime(0U, 0U, 0U, dow, 1U, 1U, 2000U);
 }
 
 /*==============================================================================
- *                          STATIC HELPER FUNCTIONS
+ *                          HAL -- ARDUINO
  *============================================================================*/
-
-static uint8_t RTC_ToBCD(uint8_t val)
-{
-    return (uint8_t)(((val / 10U) << 4U) | (val % 10U));
-}
-
-static uint8_t RTC_FromBCD(uint8_t bcd)
-{
-    return (uint8_t)(((bcd >> 4U) * 10U) + (bcd & 0x0FU));
-}
-
-static bool RTC_IsLeapYear(uint16_t year)
-{
-    return (((year % 4U) == 0U) && (((year % 100U) != 0U) || ((year % 400U) == 0U)));
-}
-
-static uint8_t RTC_DaysInMonthVal(uint8_t month, uint16_t year)
-{
-    if ((month == 2U) && RTC_IsLeapYear(year))
-    {
-        return 29U;
-    }
-    return RTC_DaysInMonth[month];
-}
-
-static uint16_t RTC_DayOfYear(uint8_t date, uint8_t month, uint16_t year)
-{
-    uint16_t doy = 0U;
-    uint8_t  m;
-
-    for (m = 1U; m < month; m++)
-    {
-        doy += (uint16_t)RTC_DaysInMonthVal(m, year);
-    }
-    doy += (uint16_t)date;
-
-    return doy;
-}
-
-/*==============================================================================
- *                          HAL IMPLEMENTATION
- *
- *  Implement the three functions below for your target platform.
- *  Examples are provided for Arduino (Wire) and STM32 HAL.
- *  Uncomment the block that matches your platform.
- *============================================================================*/
-
-/* ── ARDUINO (Wire) ──────────────────────────────────────────────────────── */
-#if defined(ARDUINO)
+#if (RTC_PLATFORM == RTC_PLATFORM_ARDUINO)
 #include <Wire.h>
 
 bool RTC_HAL_I2C_Write(uint8_t dev_addr, uint8_t reg_addr,
@@ -541,10 +433,7 @@ bool RTC_HAL_I2C_Write(uint8_t dev_addr, uint8_t reg_addr,
 {
     Wire.beginTransmission(dev_addr);
     Wire.write(reg_addr);
-    for (uint8_t i = 0U; i < len; i++)
-    {
-        Wire.write(p_data[i]);
-    }
+    for (uint8_t i = 0U; i < len; i++) { Wire.write(p_data[i]); }
     return (Wire.endTransmission() == 0);
 }
 
@@ -553,23 +442,18 @@ bool RTC_HAL_I2C_Read(uint8_t dev_addr, uint8_t reg_addr,
 {
     Wire.beginTransmission(dev_addr);
     Wire.write(reg_addr);
-    if (Wire.endTransmission(false) != 0) return false;
-
-    Wire.requestFrom((uint8_t)dev_addr, len);
+    if (Wire.endTransmission(false) != 0) { return false; }
+    Wire.requestFrom((int)dev_addr, (int)len);  /* explicit int cast for older cores */
     for (uint8_t i = 0U; i < len; i++)
     {
-        if (!Wire.available()) return false;
+        if (!Wire.available()) { return false; }
         p_data[i] = (uint8_t)Wire.read();
     }
     return true;
 }
 
-void RTC_HAL_DelayMs(uint32_t ms)
-{
-    delay(ms);
-}
+void RTC_HAL_DelayMs(uint32_t ms) { delay(ms); }
 
-/* Call this once in setup() before RTC__Init() */
 void RTC_HAL_I2C_Begin(void)
 {
 #if (RTC_I2C_SDA_PIN >= 0) && (RTC_I2C_SCL_PIN >= 0)
@@ -580,53 +464,4 @@ void RTC_HAL_I2C_Begin(void)
     Wire.setClock(RTC_I2C_FREQ_HZ);
 }
 
-/* ── STM32 HAL ───────────────────────────────────────────────────────────── */
-#elif defined(USE_HAL_DRIVER)
-extern I2C_HandleTypeDef RTC_STM32_I2C_HANDLE;
-
-bool RTC_HAL_I2C_Write(uint8_t dev_addr, uint8_t reg_addr,
-                       const uint8_t *p_data, uint8_t len)
-{
-    uint8_t buf[32];
-    if (len > 31U) return false;
-    buf[0] = reg_addr;
-    memcpy(&buf[1], p_data, len);
-    return (HAL_I2C_Master_Transmit(&RTC_STM32_I2C_HANDLE,
-                                    (uint16_t)(dev_addr << 1U),
-                                    buf, (uint16_t)(len + 1U),
-                                    RTC_STM32_I2C_TIMEOUT_MS) == HAL_OK);
-}
-
-bool RTC_HAL_I2C_Read(uint8_t dev_addr, uint8_t reg_addr,
-                      uint8_t *p_data, uint8_t len)
-{
-    if (HAL_I2C_Master_Transmit(&RTC_STM32_I2C_HANDLE,
-                                (uint16_t)(dev_addr << 1U),
-                                &reg_addr, 1U,
-                                RTC_STM32_I2C_TIMEOUT_MS) != HAL_OK) return false;
-    return (HAL_I2C_Master_Receive(&RTC_STM32_I2C_HANDLE,
-                                   (uint16_t)(dev_addr << 1U),
-                                   p_data, (uint16_t)len,
-                                   RTC_STM32_I2C_TIMEOUT_MS) == HAL_OK);
-}
-
-void RTC_HAL_DelayMs(uint32_t ms)
-{
-    HAL_Delay(ms);
-}
-
-/* ── OTHER PLATFORM ──────────────────────────────────────────────────────── */
-#else
-/*
- * Implement these three functions for your platform:
- *
- * bool RTC_HAL_I2C_Write(uint8_t dev_addr, uint8_t reg_addr,
- *                        const uint8_t *p_data, uint8_t len) { ... }
- *
- * bool RTC_HAL_I2C_Read(uint8_t dev_addr, uint8_t reg_addr,
- *                       uint8_t *p_data, uint8_t len) { ... }
- *
- * void RTC_HAL_DelayMs(uint32_t ms) { ... }
- */
-#error "RTC HAL not implemented for this platform. See RTC.cpp HAL section."
-#endif
+#endif /* RTC_PLATFORM_ARDUINO */

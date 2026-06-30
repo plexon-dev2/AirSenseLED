@@ -29,6 +29,19 @@
 #define FAN_PWM_RESOLUTION_BITS     (8U)
 #define FAN_PWM_RESOLUTION          FAN_PWM_RESOLUTION_BITS
 
+/** @brief Runtime-adjustable frequency range (BLE control slider clamps to this) */
+#define FAN_FREQ_MIN_HZ             (1000U)
+#define FAN_FREQ_MAX_HZ             (25000U)
+
+/** @brief Full-duty burst when starting fan from stopped state, to overcome
+ *         static friction/cogging torque before settling to the actual
+ *         requested duty.
+ *  @note  Increased from 300ms to 1200ms -- exhaust fan motor was not
+ *         reliably overcoming starting torque within the original 300ms
+ *         burst. If the fan still fails to start, increase further in
+ *         200ms steps (max recommended 2000ms -- see validation below). */
+#define FAN_KICKSTART_MS            (1200U)
+
 /*==============================================================================
  *                          VOLTAGE / DUTY
  *============================================================================*/

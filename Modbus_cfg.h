@@ -7,7 +7,17 @@
  *   RS485_TX  -> HW_PIN_RS485_UART_TX = GPIO18
  *   RS485_DIR -> HW_PIN_RS485_DIR     = GPIO14
  *
- * @version 2.4.0 -- all pins now reference HW_PIN_* macros
+ * @version 2.4.0
+ *
+ * v2.4.0 changes (review fixes):
+ *   - MODBUS_DEBUG_PRINTF: now routes through SERIAL_PRINTF (mutex-safe).
+ *     Raw Serial.printf during Modbus RX causes CRC corruption -- documented
+ *     in FIX 4 of Modbus.cpp. Debug path must be safe too.
+ *   - MODBUS_UART_NUM alias removed -- duplicate of MODBUS_UART_PORT.
+ *   - MODBUS_STATS_ENABLE removed -- was defined but never used to
+ *     conditionally compile statistics code (dead define).
+ *   - MODBUS_RS485_TURNAROUND_US added -- configures the post-flush guard
+ *     delay before DE/RE is released. Separate from switch delay.
  */
 
 #ifndef MODBUS_CFG_H
@@ -15,12 +25,12 @@
 
 #include <stdint.h>
 #include "HardwareConfig.h"
+#include "AppMutex.h"       /* SERIAL_PRINTF -- mutex-safe debug output */
 
 /*==============================================================================
  *                          UART CONFIGURATION
  *============================================================================*/
-#define MODBUS_UART_PORT            (2U)
-#define MODBUS_UART_NUM             MODBUS_UART_PORT
+#define MODBUS_UART_PORT            (2U)   /**< Serial2 -- HardwareSerial instance */
 
 #define MODBUS_TX_PIN               HW_PIN_RS485_UART_TX   /**< GPIO18 */
 #define MODBUS_RX_PIN               HW_PIN_RS485_UART_RX   /**< GPIO17 */
@@ -36,6 +46,15 @@
 #define MODBUS_INTER_FRAME_DELAY_MS     (4U)
 #define MODBUS_RS485_SWITCH_DELAY_US    (100U)
 #define MODBUS_TX_RX_DELAY_US           MODBUS_RS485_SWITCH_DELAY_US
+
+/**
+ * @brief Post-flush guard delay before releasing DE/RE to receive mode (us).
+ * @details Applied AFTER ModbusSerial.flush() to allow the last stop bit to
+ *          fully propagate on the RS485 bus before the driver is disabled.
+ *          At 9600 baud, 1 character = 1042us. Increase for long cable runs.
+ *          Minimum recommended: 1 full character time (1042us at 9600).
+ */
+#define MODBUS_RS485_TURNAROUND_US      (1100U)
 
 /*==============================================================================
  *                          SLAVE IDENTITY
@@ -79,16 +98,21 @@
 /*==============================================================================
  *                          STATISTICS / DEBUG
  *============================================================================*/
-#define MODBUS_STATS_ENABLE         (1U)
 #define MODBUS_DEBUG_ENABLE         (0U)
 
 #if (MODBUS_DEBUG_ENABLE == 1U)
-    #define MODBUS_DEBUG_PRINTF(...)  Serial.printf(__VA_ARGS__)
-    #define MODBUS_DEBUG_PRINT        MODBUS_DEBUG_PRINTF
-    #define MODBUS_DEBUG_PRINTLN(x)   Serial.println(x)
+    /**
+     * @brief Mutex-safe Modbus debug output -- routes through SERIAL_PRINTF.
+     * @warning DO NOT enable during active Modbus communication.
+     *          Serial output on Core 0 during UART RX causes CPU stalls that
+     *          corrupt incoming bytes -- CRC failures result. This is the root
+     *          cause documented in FIX 4 of Modbus.cpp.
+     * @note MISRA C:2012 Rule 20.10 advisory deviation: variadic macro.
+     */
+    #define MODBUS_DEBUG_PRINTF(...)    SERIAL_PRINTF(__VA_ARGS__)
+    #define MODBUS_DEBUG_PRINTLN(x)     SERIAL_PRINTF("%s\n", (x))
 #else
     #define MODBUS_DEBUG_PRINTF(...)
-    #define MODBUS_DEBUG_PRINT(...)
     #define MODBUS_DEBUG_PRINTLN(x)
 #endif
 

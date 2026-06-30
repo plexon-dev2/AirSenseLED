@@ -20,9 +20,13 @@
  *     WiFiComm__TCPServerSend("{\"t\":25,\"h\":60}");
  *     WiFiComm__MQTTPublish("aqi/sensor/data", "{\"t\":25}");
  *
- * @author
  * @date 2025-12-19
- * @version 1.0.0
+ * @version 1.1.0
+ *
+ * v1.1.0 changes (review fixes):
+ *   - WiFiComm_Status: negative enum values replaced with positive
+ *     (MISRA C:2012 Rule 10.3 -- signed integer constants in enum).
+ *   - WiFiComm__ClearCredentials(): doxygen added (was undocumented).
  */
 
 #ifndef WIFI_COMM_H
@@ -71,13 +75,14 @@ typedef enum
 
 /**
  * @brief Operation status
+ * @note  All values are non-negative (MISRA C:2012 Rule 10.3).
  */
 typedef enum
 {
-    WIFI_STATUS_OK      =  0, /**< Operation successful            */
-    WIFI_STATUS_ERROR   = -1, /**< Operation failed                */
-    WIFI_STATUS_BUSY    = -2, /**< Module busy                     */
-    WIFI_STATUS_NO_CONN = -3  /**< No active connection            */
+    WIFI_STATUS_OK      = 0U, /**< Operation successful            */
+    WIFI_STATUS_ERROR   = 1U, /**< Operation failed                */
+    WIFI_STATUS_BUSY    = 2U, /**< Module busy                     */
+    WIFI_STATUS_NO_CONN = 3U  /**< No active connection            */
 } WiFiComm_Status;
 
 /**
@@ -264,6 +269,13 @@ WiFiComm_WiFiState WiFiComm__GetWiFiState(void);
  * @return true if WiFi connected, false otherwise
  */
 bool WiFiComm__IsWiFiConnected(void);
+
+/**
+ * @brief Clear saved WiFi credentials from NVS.
+ * @details Erases the "wifi_creds" NVS namespace so the next boot
+ *          falls back to the compiled-in WIFI_SSID / WIFI_PASSWORD.
+ *          Use for factory reset or re-provisioning sequences.
+ */
 void WiFiComm__ClearCredentials(void);
 
 /**

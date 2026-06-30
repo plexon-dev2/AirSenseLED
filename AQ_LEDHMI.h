@@ -21,13 +21,18 @@
  *   MODBUS LED (Yellow): 1Hz blink while Modbus master communication is active;
  *                        stops blinking when master goes silent
  *   BLE    LED (Blue)  : OFF at boot — controlled by physical switch (GPIO8)
- *                        1Hz blink while advertising / pairing (switch ON)
- *                        Solid ON once a central device is connected
+ *                        1Hz blink while advertising / pairing (switch ON or connected)
  *                        OFF when switch turned OFF via LEDHMI__BleOff()
  *
- * @author
  * @date 2025-12-19
- * @version 1.1.0
+ * @version 1.3.0
+ *
+ * v1.3.0 changes (review fixes):
+ *   - BLE LED behaviour corrected in header: "Solid ON" removed -- LED blinks 1Hz
+ *     when connected, matching the implementation in LEDHMI__Handler()
+ *   - LEDHMI__BleOff() added (was declared but not implemented -- linker error)
+ *   - AQ_LED_Status: AQ_LED_STATUS_ERROR changed from -1 to 0xFF and enum
+ *     given explicit uint8_t-compatible values (MISRA Rule 10.3 fix)
  */
 
 #ifndef AQ_LEDHMI_H
@@ -47,19 +52,20 @@
  */
 typedef enum
 {
-    AQ_LED_OFF      = 0, /**< LED is permanently OFF          */
-    AQ_LED_ON       = 1, /**< LED is permanently ON           */
-    AQ_LED_BLINK    = 2, /**< LED is blinking (N count)       */
-    AQ_LED_TIMED_ON = 3  /**< LED is ON for a fixed duration  */
+    AQ_LED_OFF      = 0U, /**< LED is permanently OFF          */
+    AQ_LED_ON       = 1U, /**< LED is permanently ON           */
+    AQ_LED_BLINK    = 2U, /**< LED is blinking (N count)       */
+    AQ_LED_TIMED_ON = 3U  /**< LED is ON for a fixed duration  */
 } AQ_LED_State;
 
 /**
  * @brief LED operation status enumeration
+ * @note  Both values are non-negative to avoid signed/unsigned mixing (MISRA Rule 10.3).
  */
 typedef enum
 {
-    AQ_LED_STATUS_OK    =  0, /**< Operation successful */
-    AQ_LED_STATUS_ERROR = -1  /**< Operation failed     */
+    AQ_LED_STATUS_OK    = 0U,   /**< Operation successful */
+    AQ_LED_STATUS_ERROR = 0xFFU /**< Operation failed     */
 } AQ_LED_Status;
 
 /**
@@ -78,13 +84,13 @@ typedef struct
  */
 typedef struct
 {
-    AQ_LED_Config config;           /**< Hardware configuration              */
-    AQ_LED_State  state;            /**< Current LED state                   */
-    uint32_t      last_toggle_time; /**< Timestamp of last toggle (ms)       */
-    uint32_t      timed_on_start;   /**< Timestamp when timed ON started(ms) */
-    uint16_t      timed_on_duration;/**< Timed ON duration (ms)              */
-    uint8_t       blink_count;      /**< Remaining blink phases (ON+OFF = 2) */
-    uint8_t       is_on;            /**< Current physical pin state          */
+    AQ_LED_Config config;            /**< Hardware configuration              */
+    AQ_LED_State  state;             /**< Current LED state                   */
+    uint32_t      last_toggle_time;  /**< Timestamp of last toggle (ms)       */
+    uint32_t      timed_on_start;    /**< Timestamp when timed ON started(ms) */
+    uint16_t      timed_on_duration; /**< Timed ON duration (ms)              */
+    uint8_t       blink_count;       /**< Remaining blink phases (ON+OFF = 2) */
+    uint8_t       is_on;             /**< Current physical pin state          */
 } AQ_LED_Instance;
 
 /*==============================================================================
@@ -93,7 +99,6 @@ typedef struct
 
 /**
  * @brief Initialize an LED instance
- * @details Configures GPIO pin direction and sets LED to OFF state
  * @param[out] led    Pointer to LED instance to initialize
  * @param[in]  config Pointer to LED hardware configuration
  * @return AQ_LED_STATUS_OK on success, AQ_LED_STATUS_ERROR on NULL pointer
@@ -102,123 +107,91 @@ AQ_LED_Status AQLED__Init(AQ_LED_Instance *led, const AQ_LED_Config *config);
 
 /**
  * @brief Turn LED permanently ON
- * @details Sets LED state to AQ_LED_ON and drives the GPIO pin
  * @param[in,out] led Pointer to LED instance
  */
 void AQLED__On(AQ_LED_Instance *led);
 
 /**
  * @brief Turn LED permanently OFF
- * @details Sets LED state to AQ_LED_OFF and drives the GPIO pin
  * @param[in,out] led Pointer to LED instance
  */
 void AQLED__Off(AQ_LED_Instance *led);
 
 /**
- * @brief Start LED blink sequence
- * @details Blinks LED for specified count then turns OFF.
- *          Ignored if blink is already in progress.
+ * @brief Start LED blink sequence for N blinks then OFF
+ * @details Ignored if a blink is already in progress.
  * @param[in,out] led   Pointer to LED instance
- * @param[in]     count Number of blinks (must be > 0)
+ * @param[in]     count Number of blinks (1–127; values above 127 are clamped)
  */
 void AQLED__Blink(AQ_LED_Instance *led, uint8_t count);
 
 /**
- * @brief Turn LED ON for a fixed duration
- * @details Sets LED to ON and schedules automatic OFF after durationMs
+ * @brief Turn LED ON for a fixed duration then OFF automatically
  * @param[in,out] led        Pointer to LED instance
  * @param[in]     durationMs ON duration in milliseconds (must be > 0)
  */
 void AQLED__TimedOn(AQ_LED_Instance *led, uint16_t durationMs);
 
 /**
- * @brief Update LED state machine
- * @details Must be called periodically (every 50ms) to process
- *          blink counts and timed ON expiry
- * @param[in,out] led          Pointer to LED instance
+ * @brief Update LED state machine — call periodically every 50ms
+ * @param[in,out] led           Pointer to LED instance
  * @param[in]     currentTimeMs Current system time from millis()
  */
 void AQLED__Update(AQ_LED_Instance *led, uint32_t currentTimeMs);
 
 /**
  * @brief Initialize the LED HMI module
- * @details Initializes all 6 LED instances and starts:
- *          - POWER  LED solid ON
- *          - CPU    LED 1Hz continuous blink
- *          - BLE    LED OFF at boot (BLESwitch__Init enables it when switch is ON)
- *          - All other LEDs in OFF state
+ * @details Initializes all 6 LED instances:
+ *          POWER solid ON, CPU 1Hz blink, all others OFF.
  */
 void LEDHMI__Init(void);
 
 /**
- * @brief LED HMI periodic handler
- * @details Drives all LED state machines. Must be called every 50ms.
- *          Manages:
- *          - CPU    1Hz continuous blink  (500ms ON / 500ms OFF)
- *          - ERROR  1Hz blink when active (500ms ON / 500ms OFF)
- *          - ALARM  1Hz blink when active (500ms ON / 500ms OFF)
- *          - MODBUS 1Hz blink while Modbus master is active
- *          - BLE    OFF when switch OFF; 1Hz blink advertising; solid ON connected
+ * @brief LED HMI periodic handler — must be called every 50ms
+ * @details Drives all LED state machines and evaluates alarm/error conditions.
  */
 void LEDHMI__Handler(void);
 
-/**
- * @brief Indicate active alarm condition
- * @details Starts ALARM LED 1Hz blink (500ms ON / 500ms OFF)
- */
+/** @brief Indicate active alarm condition — starts ALARM LED 1Hz blink */
 void LEDHMI__AlarmActive(void);
 
-/**
- * @brief Indicate alarm cleared
- * @details Stops ALARM LED blink and turns it OFF
- */
+/** @brief Indicate alarm cleared — stops ALARM LED and turns it OFF */
 void LEDHMI__AlarmCleared(void);
 
-/**
- * @brief Indicate system error condition
- * @details Starts ERROR LED 1Hz blink (500ms ON / 500ms OFF).
- *          Error sources: fan failure, sensor stopped, no Modbus master response.
- */
+/** @brief Indicate system error condition — starts ERROR LED 1Hz blink */
 void LEDHMI__ErrorActive(void);
 
-/**
- * @brief Indicate error cleared
- * @details Stops ERROR LED blink and turns it OFF
- */
+/** @brief Indicate error cleared — stops ERROR LED and turns it OFF */
 void LEDHMI__ErrorCleared(void);
 
 /**
- * @brief Notify the LED HMI that a Modbus frame was received from the master
- * @details Call this on every valid Modbus poll/request.
- *          MODBUS LED blinks continuously while master is polling;
- *          it stops automatically when master goes silent (>2s timeout).
+ * @brief Notify that a Modbus frame was received from the master
+ * @details MODBUS LED blinks while polls arrive; stops after MODBUS_LED_TIMEOUT_MS silence.
  */
 void LEDHMI__ModbusPoll(void);
 
 /**
- * @brief Indicate Modbus data received (response sent successfully)
- * @details Kept for API compatibility with Modbus.cpp call sites.
- *          Internally updates the last-activity timestamp used by the
- *          Modbus LED keep-alive logic; no separate visual behaviour.
+ * @brief Indicate Modbus data received (response sent)
+ * @details Updates last-activity timestamp for Modbus LED keep-alive logic.
  */
 void LEDHMI__ModbusDataReceived(void);
 
 /**
  * @brief Indicate BLE central device connected
- * @details Stops pairing blink and turns BLE LED solid ON
+ * @details Starts BLE LED 1Hz blink (advertising/connected indication).
  */
 void LEDHMI__BleConnected(void);
 
 /**
  * @brief Indicate BLE central device disconnected
- * @details Turns BLE LED OFF and resumes 1Hz pairing blink (advertising)
+ * @details Turns BLE LED OFF (stops blink SM).
  */
 void LEDHMI__BleDisconnected(void);
 
 /**
- * @brief Turn BLE LED fully OFF — called when physical switch is turned OFF
- * @details Unlike BleDisconnected(), this does NOT restart the pairing blink.
- *          LED stays solid OFF until BLESwitch turns BLE back ON.
+ * @brief Turn BLE LED fully OFF — called when physical BLE switch is turned OFF
+ * @details Unlike BleDisconnected(), clears the BLE active flag so the
+ *          blink SM does not restart until BleConnected() is called again.
  */
 void LEDHMI__BleOff(void);
 

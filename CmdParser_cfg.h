@@ -1,23 +1,26 @@
 /**
  * @file CmdParser_cfg.h
- * @brief Configuration header for ZPHS01B Air Quality Sensor Command Parser
+ * @brief Configuration header for ZPHS01B/ZPHS01C Air Quality Sensor Command Parser
  *        LED Project version
  *
- * @version 2.1.0 — LED project: updated UART pins to GPIO8 (RX) / GPIO9 (TX)
+ * @version 2.2.0
  * @date 2025
  *
- * PIN CHANGES from TFT build:
- *   CMDPARSER_UART_RX_PIN : 4  → 8   (GPIO8 — SENSOR_UARTRX, moved from SPI-flash pin)
- *   CMDPARSER_UART_TX_PIN : 5  → 9   (GPIO9 — SENSOR_UARTTX, moved from SPI-flash pin)
- *   CMDPARSER_UART_CHANNEL: 1  (unchanged — Serial1)
+ * v2.2.0 changes (review fixes):
+ *   - CMDPARSER_UART_RX_PIN / TX_PIN: now reference HW_PIN_SENSOR_UARTRX /
+ *     HW_PIN_SENSOR_UARTTX from HardwareConfig.h instead of hardcoded integers.
+ *     Previous version had comment saying GPIO8/GPIO9 but actual values were 5/4
+ *     (old TFT build values) -- pin mismatch corrected.
+ *   - CMDPARSER_DEBUG_PRINTF macro added: routes through SERIAL_PRINTF
+ *     (mutex-safe). Raw Serial.printf at 1Hz on Core 0 causes Modbus RX corruption.
+ *   - CMDPARSER_ENABLE_STATISTICS and CMDPARSER_DEBUG_LEVEL removed -- were
+ *     defined but never used in CmdParser.cpp (dead defines).
+ *   - Version bumped from 2.1.0 to 2.2.0 to match CmdParser.cpp.
  *
- * IMPORTANT — DO NOT add ZPHS01B_BYTE_* macros here.
- *   All byte-position identifiers (ZPHS01B_BYTE_PM10_HIGH, ZPHS01B_BYTE_CO2_HIGH,
- *   ZPHS01B_BYTE_PM100_HIGH, etc.) are declared as an enum inside CmdParser.h.
- *   Defining them ALSO as #define macros in this cfg file causes the preprocessor
- *   to replace the enum member names with their numeric values BEFORE the compiler
- *   sees the enum — resulting in "expected identifier before '(' token" errors.
- *   Keep byte-position identifiers in the enum in CmdParser.h ONLY.
+ * IMPORTANT -- DO NOT add ZPHS01B_BYTE_* macros here.
+ *   All byte-position identifiers are declared as an enum inside CmdParser.h.
+ *   Redefining them as macros here causes preprocessor substitution inside the
+ *   enum body, breaking the enum with "expected identifier before '(' token".
  */
 
 #ifndef CMDPARSER_CFG_H
@@ -28,59 +31,53 @@
  *============================================================================*/
 #include <stdint.h>
 #include <stdbool.h>
+#include "HardwareConfig.h"
+#include "AppMutex.h"       /* SERIAL_PRINTF -- mutex-safe debug output */
 
 /*==============================================================================
  *                           UART CONFIGURATION
  *============================================================================*/
 
 /**
- * @brief UART baud rate - ZPHS01B fixed at 9600
+ * @brief UART baud rate - ZPHS01B/ZPHS01C fixed at 9600
  */
 #define CMDPARSER_UART_BAUDRATE         9600U
 
-/**
- * @brief UART data bits
- */
+/** @brief UART data bits */
 #define CMDPARSER_UART_DATABITS         8U
 
-/**
- * @brief UART stop bits
- */
+/** @brief UART stop bits */
 #define CMDPARSER_UART_STOPBITS         1U
 
-/**
- * @brief UART parity - none for ZPHS01B
- */
+/** @brief UART parity - none */
 #define CMDPARSER_UART_PARITY           0U
 
-/**
- * @brief UART hardware flow control
- */
+/** @brief UART hardware flow control */
 #define CMDPARSER_UART_FLOW_CONTROL_ENABLE false
 
 /**
  * @brief UART channel on ESP32-S3
- * @note  0 = Serial  (USB CDC / HWCDC — do NOT use for sensor; only accepts 1 arg in begin())
- *        1 = Serial1 (HardwareSerial — sensor UART)
- *        2 = Serial2 (HardwareSerial — Modbus RS485)
- * @warning Keep this as 1 for the sensor port. If set to 0 the compiler will
- *          report "no matching function for HWCDC::begin(4 args)" because the
- *          USB CDC Serial does not support the 4-argument begin() form.
+ * @note  1 = Serial1 (HardwareSerial -- sensor UART)
+ *        2 = Serial2 (HardwareSerial -- Modbus RS485)
+ * @warning Do NOT use channel 0 (USB CDC). It does not support the 4-argument
+ *          begin() form and will cause a compile error.
  */
 #define CMDPARSER_UART_CHANNEL          1U
 
 /**
- * @brief UART RX pin — ESP32-S3 GPIO for ZPHS01B TX line
- * @note  LED build: GPIO8 (SENSOR_UARTRX) — moved from GPIO4 (SPI flash conflict)
+ * @brief UART RX pin -- ESP32-S3 GPIO connected to ZPHS01B/C TX line.
+ * @note  Sourced from HardwareConfig.h (HW_PIN_SENSOR_UARTRX).
+ *        Previous version had hardcoded value 5 (old TFT build) while the
+ *        comment stated GPIO8 -- mismatch fixed by referencing HardwareConfig.
  */
-#define CMDPARSER_UART_RX_PIN           5
+#define CMDPARSER_UART_RX_PIN           HW_PIN_SENSOR_UARTRX
 
 /**
- * @brief UART TX pin — ESP32-S3 GPIO for ZPHS01B RX line
- * @note  LED build: GPIO9 (SENSOR_UARTTX) — moved from GPIO5 (SPI flash conflict)
- *        Set to -1 if TX not needed (query not used, auto-stream mode)
+ * @brief UART TX pin -- ESP32-S3 GPIO connected to ZPHS01B/C RX line.
+ * @note  Sourced from HardwareConfig.h (HW_PIN_SENSOR_UARTTX).
+ *        Set to -1 if TX not needed (auto-stream mode, no query commands).
  */
-#define CMDPARSER_UART_TX_PIN           4
+#define CMDPARSER_UART_TX_PIN           HW_PIN_SENSOR_UARTTX
 
 /*==============================================================================
  *                           BUFFER CONFIGURATION
@@ -163,16 +160,29 @@
 
 /*==============================================================================
  *                          DEBUG CONFIGURATION
+ *  @note Will be controlled by ProjectConfig.h once integrated.
+ *        CMDPARSER_DEBUG_PRINTF routes through SERIAL_PRINTF (mutex-safe).
+ *        Raw Serial.printf at 1Hz on Core 0 causes Modbus RX byte corruption.
  *============================================================================*/
 
 /**
- * @brief Debug level
- * @note  0=None, 1=Error only, 2=Error+Warn, 3=Info, 4=Verbose
+ * @brief Debug level: 0=off, 1=errors, 2=warnings, 3=info, 4=verbose.
+ * @note  Keep 0 in production -- Serial output at sensor frame rate (~1Hz)
+ *        on Core 0 causes Serial contention with Core 1 (Modbus/LEDHMI).
  */
-#define CMDPARSER_DEBUG_LEVEL               1U
+#define CMDPARSER_DEBUG_LEVEL               0U
 
-/** @brief Enable statistics collection */
-#define CMDPARSER_ENABLE_STATISTICS         true
+#if (CMDPARSER_DEBUG_LEVEL > 0U)
+    /**
+     * @note MISRA C:2012 Rule 20.10 advisory deviation: variadic macro.
+     *       Rationale: no compliant alternative for printf-style debug.
+     */
+    #define CMDPARSER_DEBUG_PRINTF(...)     SERIAL_PRINTF(__VA_ARGS__)
+    #define CMDPARSER_DEBUG_PRINTLN(x)      SERIAL_PRINTF("%s\n", (x))
+#else
+    #define CMDPARSER_DEBUG_PRINTF(...)
+    #define CMDPARSER_DEBUG_PRINTLN(x)
+#endif
 
 /*==============================================================================
  *                        COMPILE-TIME VALIDATION

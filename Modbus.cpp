@@ -1,4 +1,3 @@
-
 /**
  * @file Modbus.cpp
  * @brief Modbus RTU Slave — Air Quality Monitor ESP32-S3
@@ -45,7 +44,26 @@
  * FIX 6 — Modbus_HandleReadHoldingRegisters() restored (v2.2.0).
  *   Function was accidentally deleted during editing.
  *
- * @version 2.3.0
+ * @version 2.4.0
+ *
+ * v2.4.0 changes (review fixes):
+ *   - Duplicate MODBUS_DBG_PRINTF / MODBUS_DBG_PRINTLN macros removed from
+ *     .cpp -- were duplicating and conflicting with MODBUS_DEBUG_PRINTF in
+ *     Modbus_cfg.h. One debug macro set now lives in _cfg.h only, routing
+ *     through SERIAL_PRINTF (mutex-safe).
+ *   - Commented-out setRxBufferSize(512) removed (dead code).
+ *   - MODBUS_UART_NUM reference replaced with MODBUS_UART_PORT.
+ *   - Modbus_CalculateCRC: data parameter now const uint8_t *.
+ *   - Modbus_ProcessFrame: frame parameter now const uint8_t *.
+ *   - response[256] static local moved to file scope.
+ *   - Modbus_SetDataValid(): implemented -- writes to REG_RESERVED_18.
+ *   - Modbus_GetDataValid(): fixed -- reads REG_RESERVED_18 directly instead
+ *     of deriving validity from temperature register (was wrong at 0 degC).
+ *   - delayMicroseconds(500) replaced with MODBUS_RS485_TURNAROUND_US (1100us)
+ *     for correct full-character-time turnaround guard on 9600 baud.
+ *   - invalid_requests double-count fixed: removed increment from
+ *     Modbus_SendException(); caller in Modbus_ProcessFrame() increments it.
+ *   - Non-ASCII dash characters replaced with ASCII -- in comments.
  */
 
 #include "Modbus.h"
@@ -55,27 +73,16 @@
 
 /*==============================================================================
  *                          DEBUG PRINT CONTROL
+ *  Debug macros are defined in Modbus_cfg.h as MODBUS_DEBUG_PRINTF.
+ *  They route through SERIAL_PRINTF (mutex-safe).
+ *  DO NOT add Serial.printf calls here -- see FIX 4 in the file header.
  *============================================================================*/
-/**
- * @brief Set to 0 for production, 1 for debug
- * @details Serial prints during Modbus RX cause byte corruption due to
- *          CPU stalls from Serial lock contention. Disable for production.
- */
-#define MODBUS_DEBUG_PRINT_ENABLE  (0U)
-
-#if (MODBUS_DEBUG_PRINT_ENABLE == 1U)
-  #define MODBUS_DBG_PRINTF(...)   Serial.printf(__VA_ARGS__)
-  #define MODBUS_DBG_PRINTLN(...)  Serial.println(__VA_ARGS__)
-#else
-  #define MODBUS_DBG_PRINTF(...)   /* Disabled */
-  #define MODBUS_DBG_PRINTLN(...)  /* Disabled */
-#endif
 
 /* ============================================================================
  * PRIVATE VARIABLES
  * ============================================================================ */
 
-static HardwareSerial      ModbusSerial(MODBUS_UART_NUM);
+static HardwareSerial      ModbusSerial(MODBUS_UART_PORT);
 static bool                modbus_initialized = false;
 static uint16_t            holding_registers[MODBUS_HOLDING_REG_COUNT] = {0};
 static uint8_t             rx_buffer[MODBUS_BUFFER_SIZE];
@@ -83,17 +90,24 @@ static uint16_t            rx_index     = 0;
 static uint32_t            last_rx_time = 0;
 static Modbus_Statistics_t statistics   = {0};
 
+/**
+ * @brief FC03 response buffer -- file scope to avoid 256-byte static local.
+ *        Only accessed from Modbus_HandleReadHoldingRegisters() on Core 0.
+ *        Max size: 3 header + (MODBUS_HOLDING_REG_COUNT * 2) data + 2 CRC.
+ */
+static uint8_t s_response_buf[3U + (MODBUS_HOLDING_REG_COUNT * 2U) + 2U];
+
 /* ============================================================================
  * PRIVATE FUNCTION PROTOTYPES
  * ============================================================================ */
 
-static uint16_t Modbus_CalculateCRC(uint8_t *data, uint16_t length);
+static uint16_t Modbus_CalculateCRC(const uint8_t *data, uint16_t length);
 static void     Modbus_SetRS485Transmit(void);
 static void     Modbus_SetRS485Receive(void);
-static void     Modbus_ProcessFrame(uint8_t *frame, uint16_t length);
+static void     Modbus_ProcessFrame(const uint8_t *frame, uint16_t length);
 static void     Modbus_SendResponse(uint8_t *response, uint16_t length);
 static void     Modbus_SendException(uint8_t function_code, uint8_t exception_code);
-static void     Modbus_HandleReadHoldingRegisters(uint8_t *frame, uint16_t length);
+static void     Modbus_HandleReadHoldingRegisters(const uint8_t *frame, uint16_t length);
 static void     Modbus_FloatToRegisters_LE(float value, uint16_t *low_reg, uint16_t *high_reg);
 
 /* ============================================================================
@@ -102,26 +116,28 @@ static void     Modbus_FloatToRegisters_LE(float value, uint16_t *low_reg, uint1
 
 void Modbus_Init(void)
 {
-    MODBUS_DBG_PRINTLN("[MODBUS] v2.3.0 — flush() TX fix active");
-    /* Larger RX buffer reduces risk of byte loss during brief CPU stalls
-     * caused by WiFi/BLE interrupts on Core 0. */
-     //ModbusSerial.setRxBufferSize(512);
-     ModbusSerial.begin(MODBUS_BAUD_RATE, SERIAL_8N1,
+    MODBUS_DEBUG_PRINTLN("[MODBUS] v2.4.0 -- flush() TX fix active");
+
+    /* Inline RX/TX FIFO sizes: 256 byte RX, 128 byte TX.
+     * Larger RX buffer reduces byte loss during brief CPU stalls from
+     * WiFi/BLE interrupts on Core 0. */
+    ModbusSerial.begin(MODBUS_BAUD_RATE, SERIAL_8N1,
                        MODBUS_RX_PIN, MODBUS_TX_PIN,
                        false, 256U, 128U);
 
-    MODBUS_DBG_PRINTF("[MODBUS] UART init: uart=%d baud=%lu rx=%d tx=%d de_re=%d\n",
-                  (int)MODBUS_UART_NUM, (unsigned long)MODBUS_BAUD_RATE,
-                  (int)MODBUS_RX_PIN, (int)MODBUS_TX_PIN, (int)MODBUS_DE_RE_PIN);
+    MODBUS_DEBUG_PRINTF("[MODBUS] UART init: uart=%d baud=%lu rx=%d tx=%d de_re=%d\n",
+                        (int)MODBUS_UART_PORT, (unsigned long)MODBUS_BAUD_RATE,
+                        (int)MODBUS_RX_PIN, (int)MODBUS_TX_PIN, (int)MODBUS_DE_RE_PIN);
 
     pinMode(MODBUS_DE_RE_PIN, OUTPUT);
     Modbus_SetRS485Receive();
 
     memset(holding_registers, 0, sizeof(holding_registers));
+    memset(s_response_buf,    0, sizeof(s_response_buf));
     Modbus_ResetStatistics();
 
     /* Flush any stale bytes in the UART RX FIFO */
-    while (ModbusSerial.available()) { ModbusSerial.read(); }
+    while (ModbusSerial.available()) { (void)ModbusSerial.read(); }
 
     if (MODBUS_RX_PIN < 0 || MODBUS_TX_PIN < 0)
     {
@@ -134,11 +150,11 @@ void Modbus_Init(void)
 
     modbus_initialized = true;
 
-    MODBUS_DBG_PRINTLN("[MODBUS] Ready — FC03 slave");
-    MODBUS_DBG_PRINTF ("[MODBUS] Registers: %d (9 params x 2 regs, all float32)\n",
-                   MODBUS_HOLDING_REG_COUNT);
-    MODBUS_DBG_PRINTLN("[MODBUS] Word order: Little Endian (LOW word first = CDAB)");
-    MODBUS_DBG_PRINTLN("[MODBUS] ModScan32: Length=18, Float CDAB or Modicon byte order");
+    MODBUS_DEBUG_PRINTLN("[MODBUS] Ready -- FC03 slave");
+    MODBUS_DEBUG_PRINTF ("[MODBUS] Registers: %d (9 params x 2 regs, all float32)\n",
+                         (int)MODBUS_HOLDING_REG_COUNT);
+    MODBUS_DEBUG_PRINTLN("[MODBUS] Word order: Little Endian (LOW word first = CDAB)");
+    MODBUS_DEBUG_PRINTLN("[MODBUS] ModScan32: Length=18, Float CDAB or Modicon byte order");
 }
 
 /* ----------------------------------------------------------------------------
@@ -173,8 +189,8 @@ void Modbus_Handler(void)
         uint32_t gap = micros() - last_rx_time;
         if (gap >= MODBUS_FRAME_DELAY_US)
         {
-            MODBUS_DEBUG_PRINT("[MODBUS] Frame: %d bytes, gap=%luus\n",
-                               rx_index, gap);
+            MODBUS_DEBUG_PRINTF("[MODBUS] Frame: %d bytes, gap=%luus\n",
+                                (int)rx_index, (unsigned long)gap);
             Modbus_ProcessFrame(rx_buffer, rx_index);
             rx_index = 0;
         }
@@ -245,9 +261,9 @@ Modbus_StatusType_t Modbus_UpdateSensorData(const CmdParser_ZPHS01B_Data_t *aq_d
     /* Atomic copy — Modbus_Handler sees all-old or all-new, never partial */
     memcpy(holding_registers, shadow, sizeof(holding_registers));
 
-    MODBUS_DEBUG_PRINT("[MODBUS] Regs updated — T=%.1f H=%.0f CO2=%.0f\n",
-                       aq_data->temperature, (float)aq_data->humidity,
-                       (float)aq_data->co2);
+    MODBUS_DEBUG_PRINTF("[MODBUS] Regs updated -- T=%.1f H=%.0f CO2=%.0f\n",
+                        (double)aq_data->temperature, (double)(float)aq_data->humidity,
+                        (double)(float)aq_data->co2);
 
     return MODBUS_STATUS_OK;
 }
@@ -255,14 +271,18 @@ Modbus_StatusType_t Modbus_UpdateSensorData(const CmdParser_ZPHS01B_Data_t *aq_d
 Modbus_StatusType_t Modbus_SetDataValid(uint16_t valid)
 {
     if (!modbus_initialized) { return MODBUS_STATUS_INIT_FAILED; }
-    (void)valid;
+    /* Write data-valid flag to dedicated register REG_RESERVED_18.
+     * 1 = data valid, 0 = data invalid (sensor not yet ready). */
+    holding_registers[REG_RESERVED_18] = (valid != 0U) ? 1U : 0U;
     return MODBUS_STATUS_OK;
 }
 
 Modbus_StatusType_t Modbus_GetDataValid(uint16_t *valid)
 {
     if (!modbus_initialized || valid == NULL) { return MODBUS_STATUS_INIT_FAILED; }
-    *valid = (holding_registers[REG_TEMPERATURE_HIGH] != 0U) ? 1U : 0U;
+    /* Read data-valid flag from REG_RESERVED_18.
+     * Previously derived from temperature register -- was wrong at 0 degC. */
+    *valid = holding_registers[REG_RESERVED_18];
     return MODBUS_STATUS_OK;
 }
 
@@ -297,13 +317,13 @@ void Modbus_ResetStatistics(void)
 
 void Modbus_PrintStatistics(void)
 {
-    MODBUS_DBG_PRINTLN("[MODBUS] ===== STATISTICS =====");
-    MODBUS_DBG_PRINTF ("[MODBUS] Frames Received   : %lu\n", statistics.frames_received);
-    MODBUS_DBG_PRINTF ("[MODBUS] Frames Transmitted: %lu\n", statistics.frames_transmitted);
-    MODBUS_DBG_PRINTF ("[MODBUS] Successful Reads  : %lu\n", statistics.successful_reads);
-    MODBUS_DBG_PRINTF ("[MODBUS] CRC Errors        : %lu\n", statistics.crc_errors);
-    MODBUS_DBG_PRINTF ("[MODBUS] Invalid Requests  : %lu\n", statistics.invalid_requests);
-    MODBUS_DBG_PRINTLN("[MODBUS] ====================");
+    MODBUS_DEBUG_PRINTLN("[MODBUS] ===== STATISTICS =====");
+    MODBUS_DEBUG_PRINTF ("[MODBUS] Frames Received   : %lu\n", (unsigned long)statistics.frames_received);
+    MODBUS_DEBUG_PRINTF ("[MODBUS] Frames Transmitted: %lu\n", (unsigned long)statistics.frames_transmitted);
+    MODBUS_DEBUG_PRINTF ("[MODBUS] Successful Reads  : %lu\n", (unsigned long)statistics.successful_reads);
+    MODBUS_DEBUG_PRINTF ("[MODBUS] CRC Errors        : %lu\n", (unsigned long)statistics.crc_errors);
+    MODBUS_DEBUG_PRINTF ("[MODBUS] Invalid Requests  : %lu\n", (unsigned long)statistics.invalid_requests);
+    MODBUS_DEBUG_PRINTLN("[MODBUS] ====================");
 }
 
 /* ============================================================================
@@ -332,7 +352,7 @@ static void Modbus_SetRS485Receive(void)
     digitalWrite(MODBUS_DE_RE_PIN, LOW);
 }
 
-static uint16_t Modbus_CalculateCRC(uint8_t *data, uint16_t length)
+static uint16_t Modbus_CalculateCRC(const uint8_t *data, uint16_t length)
 {
     uint16_t crc = 0xFFFF;
     for (uint16_t i = 0; i < length; i++)
@@ -360,13 +380,13 @@ static void Modbus_FloatToRegisters_LE(float value, uint16_t *low_reg, uint16_t 
  * FIX 4: LEDHMI__ModbusPoll() NOT called here — moved to after response TX.
  * FIX 5: CRC read as little-endian (low byte = frame[length-2]).
  * -------------------------------------------------------------------------- */
-static void Modbus_ProcessFrame(uint8_t *frame, uint16_t length)
+static void Modbus_ProcessFrame(const uint8_t *frame, uint16_t length)
 {
     statistics.frames_received++;
 
-    MODBUS_DEBUG_PRINT("[MODBUS] Frame #%lu: ", statistics.frames_received);
-    for (uint16_t i = 0; i < length; i++) { MODBUS_DEBUG_PRINT("%02X ", frame[i]); }
-    MODBUS_DEBUG_PRINT("\n");
+    MODBUS_DEBUG_PRINTF("[MODBUS] Frame #%lu: ", (unsigned long)statistics.frames_received);
+    for (uint16_t i = 0; i < length; i++) { MODBUS_DEBUG_PRINTF("%02X ", frame[i]); }
+    MODBUS_DEBUG_PRINTF("\n");
 
     if (length < 5)
     {
@@ -374,7 +394,7 @@ static void Modbus_ProcessFrame(uint8_t *frame, uint16_t length)
         return;
     }
 
-    /* FIX 5: Modbus CRC is little-endian — low byte first, high byte second */
+    /* FIX 5: Modbus CRC is little-endian -- low byte first, high byte second */
     uint16_t received_crc   = ((uint16_t)frame[length - 2])
                             | ((uint16_t)frame[length - 1] << 8);
     uint16_t calculated_crc = Modbus_CalculateCRC(frame, length - 2);
@@ -382,15 +402,15 @@ static void Modbus_ProcessFrame(uint8_t *frame, uint16_t length)
     if (received_crc != calculated_crc)
     {
         statistics.crc_errors++;
-        MODBUS_DBG_PRINTF("[MODBUS] CRC FAIL — got 0x%04X expected 0x%04X\n",
-                      received_crc, calculated_crc);
-        while (ModbusSerial.available()) { ModbusSerial.read(); }
+        MODBUS_DEBUG_PRINTF("[MODBUS] CRC FAIL -- got 0x%04X expected 0x%04X\n",
+                            received_crc, calculated_crc);
+        while (ModbusSerial.available()) { (void)ModbusSerial.read(); }
         rx_index = 0;
         return;
     }
 
-    MODBUS_DEBUG_PRINT("[MODBUS] Frame OK — addr=%u FC=%u len=%u\n",
-                       frame[0], frame[1], length);
+    MODBUS_DEBUG_PRINTF("[MODBUS] Frame OK -- addr=%u FC=%u len=%u\n",
+                        frame[0], frame[1], length);
 
     if (frame[0] != MODBUS_SLAVE_ID)
     {
@@ -404,8 +424,10 @@ static void Modbus_ProcessFrame(uint8_t *frame, uint16_t length)
             Modbus_HandleReadHoldingRegisters(frame, length);
             break;
         default:
-            Modbus_SendException(frame[1], MODBUS_EXCEPTION_ILLEGAL_FUNCTION);
+            /* Increment invalid_requests BEFORE SendException to avoid double-count.
+             * Modbus_SendException() does NOT increment invalid_requests. */
             statistics.invalid_requests++;
+            Modbus_SendException(frame[1], MODBUS_EXCEPTION_ILLEGAL_FUNCTION);
             break;
     }
 }
@@ -434,9 +456,9 @@ static void Modbus_ProcessFrame(uint8_t *frame, uint16_t length)
  * FIX 4: LEDHMI__ModbusPoll() called AFTER Modbus_SendResponse() —
  *        never during frame reception or CRC validation.
  * -------------------------------------------------------------------------- */
-static void Modbus_HandleReadHoldingRegisters(uint8_t *frame, uint16_t length)
+static void Modbus_HandleReadHoldingRegisters(const uint8_t *frame, uint16_t length)
 {
-    MODBUS_DEBUG_PRINT("[MODBUS] FC03 request — addr=%u len=%u\n", frame[0], length);
+    MODBUS_DEBUG_PRINTF("[MODBUS] FC03 request -- addr=%u len=%u\n", frame[0], length);
 
     if (length != 8)
     {
@@ -448,7 +470,7 @@ static void Modbus_HandleReadHoldingRegisters(uint8_t *frame, uint16_t length)
     uint16_t start_addr = ((uint16_t)frame[2] << 8) | frame[3];
     uint16_t reg_count  = ((uint16_t)frame[4] << 8) | frame[5];
 
-    MODBUS_DEBUG_PRINT("[MODBUS] Read regs: start=%u count=%u\n", start_addr, reg_count);
+    MODBUS_DEBUG_PRINTF("[MODBUS] Read regs: start=%u count=%u\n", start_addr, reg_count);
 
     if ((start_addr + reg_count) > MODBUS_HOLDING_REG_COUNT)
     {
@@ -457,38 +479,34 @@ static void Modbus_HandleReadHoldingRegisters(uint8_t *frame, uint16_t length)
         return;
     }
 
-    /* Build response — max size: 3 header + 125*2 data + 2 CRC = 255 bytes */
-    static uint8_t response[256];
-    uint16_t idx = 0;
+    /* Build response into file-scope buffer (avoids 256-byte static local).
+     * Max size: 3 header + (MODBUS_HOLDING_REG_COUNT * 2) data + 2 CRC. */
+    uint16_t idx = 0U;
 
-    response[idx++] = MODBUS_SLAVE_ID;
-    response[idx++] = MODBUS_FC_READ_HOLDING_REGS;
-    response[idx++] = (uint8_t)(reg_count * 2U);   /* byte count */
+    s_response_buf[idx++] = MODBUS_SLAVE_ID;
+    s_response_buf[idx++] = MODBUS_FC_READ_HOLDING_REGS;
+    s_response_buf[idx++] = (uint8_t)(reg_count * 2U);   /* byte count */
 
     /* Registers: high byte first (big-endian per register, per Modbus spec) */
-    for (uint16_t i = 0; i < reg_count; i++)
+    for (uint16_t i = 0U; i < reg_count; i++)
     {
         uint16_t reg_val = holding_registers[start_addr + i];
-        response[idx++] = (uint8_t)((reg_val >> 8) & 0xFFU);   /* high byte */
-        response[idx++] = (uint8_t)(reg_val & 0xFFU);           /* low byte  */
+        s_response_buf[idx++] = (uint8_t)((reg_val >> 8) & 0xFFU);
+        s_response_buf[idx++] = (uint8_t)(reg_val & 0xFFU);
     }
 
-    /* Append CRC — little-endian (low byte first) */
-    uint16_t crc    = Modbus_CalculateCRC(response, idx);
-    response[idx++] = (uint8_t)(crc & 0xFFU);
-    response[idx++] = (uint8_t)((crc >> 8) & 0xFFU);
+    /* Append CRC -- little-endian (low byte first) */
+    uint16_t crc          = Modbus_CalculateCRC(s_response_buf, idx);
+    s_response_buf[idx++] = (uint8_t)(crc & 0xFFU);
+    s_response_buf[idx++] = (uint8_t)((crc >> 8) & 0xFFU);
 
-    #if MODBUS_DEBUG_ENABLE
-    MODBUS_DBG_PRINTF("[MODBUS] Sending %u bytes:", idx);
-    for (uint16_t i = 0; i < idx; i++) { MODBUS_DBG_PRINTF(" %02X", response[i]); }
-    MODBUS_DBG_PRINTLN();
-    #endif
+    MODBUS_DEBUG_PRINTF("[MODBUS] Sending %u bytes\n", (unsigned)idx);
 
-    Modbus_SendResponse(response, idx);
+    Modbus_SendResponse(s_response_buf, idx);
 
     statistics.successful_reads++;
 
-    /* FIX 4: LEDHMI poll AFTER response is fully transmitted —
+    /* FIX 4: LEDHMI poll AFTER response is fully transmitted --
      * prevents Serial contention with Core 1 during frame reception */
     LEDHMI__ModbusPoll();
 }
@@ -525,10 +543,11 @@ static void Modbus_SendResponse(uint8_t *response, uint16_t length)
 
     /* Wait until every bit is physically transmitted before releasing the bus */
     ModbusSerial.flush();
-    
-    /* FIX: Allow last byte to fully settle on bus before switching to RX.
-     * At 9600 baud, 1 char = 1.04ms. 500µs guard ensures clean turnaround. */
-    delayMicroseconds(500);
+
+    /* Guard delay: ensure last stop bit has fully propagated on the RS485 bus
+     * before DE/RE is pulled LOW. At 9600 baud, 1 char = 1042us.
+     * MODBUS_RS485_TURNAROUND_US is set to one full character time (1100us). */
+    delayMicroseconds(MODBUS_RS485_TURNAROUND_US);
 
     Modbus_SetRS485Receive();
     statistics.frames_transmitted++;
@@ -543,7 +562,7 @@ static void Modbus_SendException(uint8_t function_code, uint8_t exception_code)
     if (!modbus_initialized) { return; }
 
     static uint8_t response[5];
-    uint8_t idx = 0;
+    uint8_t idx = 0U;
 
     response[idx++] = MODBUS_SLAVE_ID;
     response[idx++] = function_code | 0x80U;
@@ -555,10 +574,11 @@ static void Modbus_SendException(uint8_t function_code, uint8_t exception_code)
 
     Modbus_SetRS485Transmit();
     ModbusSerial.write(response, 5);
-    ModbusSerial.flush();           /* wait for last bit before releasing bus */
-    delayMicroseconds(500);         /* FIX: Allow bus to settle */
+    ModbusSerial.flush();
+    delayMicroseconds(MODBUS_RS485_TURNAROUND_US);
     Modbus_SetRS485Receive();
 
     statistics.frames_transmitted++;
-    statistics.invalid_requests++;
+    /* NOTE: invalid_requests is incremented by the caller (Modbus_ProcessFrame)
+     * BEFORE calling this function -- do NOT increment here to avoid double-count. */
 }
